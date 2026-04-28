@@ -1,0 +1,938 @@
+---
+title: 'Chicago Wildfire: Main Analysis'
+author: "Aaron Lilienfeld"
+fig_width: 6
+output:
+  html_document:
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  word_document:
+    toc: yes
+    toc_depth: 4
+fig_height: 4
+---
+
+# Program background
+
+* **Script name**: CW_Daily_PM25_Analysis_ITS.RMD
+
+* **Project name**: Chicago Wildfire 
+   
+* **Program description**: 
+
+* **Data**: 
+
+* **Restrictions**:
+   
+* **Outline of program/analysis**:
+
+* **Author**:	Aaron Lilienfeld         				
+
+* **Date**:  
+
+* **Revisions (by/date)**:
+
+* **Input files**:
+
+* **Output files**:
+ 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, comment = NA, fig.width = 10)
+options(scipen = 999)
+```
+
+```{r load library}
+# Load library
+library("tidyverse")
+library("sf")
+library("kableExtra")
+library("cowplot")
+library("nlme")
+library("table1")
+library("AICcmodavg")
+library("mgcv")
+library("gratia")
+library("zoo")
+
+```
+
+```{r load and process data, include=FALSE}
+
+# Create neighborhood objects 
+far_north_side <- toupper(c("Ohare", "O'HARE", "Norwood Park", "Edison Park", "Jefferson Park", "Forest Glen",
+                            "North Park", "Albany Park", "Lincoln Square", "West Ridge", "Edgewater", "Rogers Park", "Uptown"))
+northwest_side <- toupper(c("Dunning", "Montclare", "Belmont Cragin", "Hermosa", "Irving Park", "Portage Park"))
+north_side <- toupper(c("Logan Square", "Avondale", "North Center", "Lake View", "Lincoln Park"))
+west_side <- toupper(c("Austin", "Humboldt Park", "West Town", "West Garfield Park", "East Garfield Park", "Near West Side",
+                       "North Lawndale", "South Lawndale", "Lower West Side"))
+central <- toupper(c("Near North Side", "Loop", "Near South Side"))
+southwest_side <- toupper(c("Garfield Ridge", "Clearing", "Archer Heights", "West Elsdon", "West Lawn",
+                            "Chicago Lawn", "Gage Park", "Brighton Park", "McKinley Park", "New City",
+                            "West Englewood", "Englewood"))
+south_side <- toupper(c("Bridgeport", "Armour Square", "Douglas", "Fuller Park", "Grand Boulevard", "Greater Grand Crossing",
+                        "Washington Park", "Kenwood", "Hyde Park", "Woodlawn", "South Shore", "Oakland"))
+far_southwest_side <- toupper(c("Ashburn", "Auburn Gresham", "Beverly", "Mount Greenwood", "Morgan Park", "Washington Heights"))
+far_southeast_side <- toupper(c("Chatham", "Roseland", "West Pullman", "Avalon Park", "Burnside",
+                                "Pullman", "Riverdale", "Hegewisch", "South Deering", "South Chicago", "East Side", "Calumet Heights"))
+
+# Load tract to community areas definition
+trt_community_areas <- data.table::fread("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/Trt_Chicago_Community_Areas_2020.csv", 
+                                         colClasses = c("GEOID20" = "character")) %>% 
+  rename("geoid" = "GEOID20",
+         "Community" = "COMMUNIT_1") %>% 
+  mutate(Community = toupper(Community),
+         Neighborhood = if_else(Community %in% far_north_side, "Far North Side",
+                          if_else(Community %in% northwest_side, "Northwest Side", 
+                                  if_else(Community %in% north_side, "North Side",
+                                          if_else(Community %in% west_side, "West Side", 
+                                                  if_else(Community %in% central, "Central", 
+                                                          if_else(Community %in% southwest_side, "Southwest Side", 
+                                                                  if_else(Community %in% south_side, "South Side",
+                                                                          if_else(Community %in% far_southeast_side, "Far Southeast Side", 
+                                                                                  if_else(Community %in% far_southwest_side, "Far Southwest Side", NA)))))))))) %>% 
+  select(1,3,4) 
+
+# Load tract shapefile 
+trt_boundaries <- st_read("~/Documents/CEHI/Chicago_Wildfire/Data/tl_2020_17031_tract20/tl_2020_17031_tract20.shp") %>% 
+  filter(ALAND20 != 0) %>% 
+  rename("geoid" = "GEOID20") %>% 
+  select(geoid) %>% 
+  inner_join(trt_community_areas, by = "geoid") %>% 
+  mutate(Community = str_to_title(Community),
+         Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central",
+                                          "South Side", "Southwest Side", "Far Southwest Side", "Far Southeast Side"))) %>% 
+  st_set_crs(value = 26971) # NAD83 StatePlane Illinois East FIPS 1201
+  
+# Load Chicago community areas .shp file 
+community_areas <- st_read("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/geo_export_933d2c08-f55b-413e-b529-b6b061fe738d.shp") %>% 
+  st_set_crs(value = 26971) %>% 
+  rename("Community" = "community") %>% 
+  mutate(Neighborhood = if_else(Community %in% far_north_side, "Far North Side",
+                          if_else(Community %in% northwest_side, "Northwest Side", 
+                                  if_else(Community %in% north_side, "North Side",
+                                          if_else(Community %in% west_side, "West Side", 
+                                                  if_else(Community %in% central, "Central", 
+                                                          if_else(Community %in% southwest_side, "Southwest Side", 
+                                                                  if_else(Community %in% south_side, "South Side",
+                                                                          if_else(Community %in% far_southeast_side, "Far Southeast Side", 
+                                                                                  if_else(Community %in% far_southwest_side, "Far Southwest Side", NA)))))))))) %>% 
+  select(Community, Neighborhood)
+
+community_areas$Community[community_areas$Community == "OHARE"] <- "O'HARE"
+
+
+# Chicago Health Atlas data 
+# There are 4 separate data files to read in 
+community_areas_sociodemo <- data.table::fread("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/CHA_Community_Areas_CT.csv")[-c(1:4),] %>% 
+  rename("geoid" = "GEOID",
+         "Uninsured_rate" = "UNS_2018-2022",
+         "COPD_rate" = "LNG_2021",
+         "Disability_rate" = "DIS_2018-2022",
+         "Unemployment_rate" = "UMP_2018-2022",
+         "pctNHwht" = "PCT-W_2018-2022",
+         "pctNHblk" = "PCT-B_2018-2022",
+         "pctHisp" = "PCT-H_2018-2022",
+         "HS_grad_rate" = "EDB_2018-2022",
+         "Coll_grad_rate" =  "EDE_2018-2022",
+         "Poverty_rate" = "POV_2018-2022",
+         "MedHHinc" = "INC_2018-2022") %>% 
+  select(3,Population,13:15,10:12,8:9,5:7) %>% 
+  mutate_at(.vars = c(2:13), as.numeric) %>% 
+  mutate(across(3:13, round, 1)) %>% 
+  inner_join(trt_community_areas, by = "geoid") %>% 
+  select(1,14,15,2:13) %>% 
+  mutate(Community = str_to_title(Community),
+         Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central",
+                                          "South Side", "Southwest Side", "Far Southwest Side", "Far Southeast Side")))
+
+community_areas_sociodemo2 <- data.table::fread("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/CHA_Community_Areas_CT_v2.csv")[-c(1:4),] %>% 
+  rename("geoid" = "GEOID",
+         "Medicaid_rate" = "MCD_2019-2023",
+         "Major_crimes" = "CZM_2020-2024",
+         "Eviction_rate" = "EVR_2018",
+         "Walkability_index" = "EKW_2024",
+         "Rent_burdened_rate" = "RBU_2019-2023",
+         "Ever_had_cancer_rate" = "CAN_2022",
+         "Crowded_housing_rate" = "HTJ_2019-2023") %>% 
+  select(geoid, Medicaid_rate, Major_crimes, Eviction_rate, Walkability_index, Rent_burdened_rate, Ever_had_cancer_rate, Crowded_housing_rate) %>% 
+  mutate_at(.vars = c(2:8), as.numeric) %>% 
+  mutate(across(2:8, round, 1)) %>% 
+  inner_join(trt_community_areas, by = "geoid") %>% 
+  select(1, 9, 10, 1:8)
+
+community_areas_sociodemo3 <- data.table::fread("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/CHA_Community_Areas.csv")[-c(1:4),] %>% 
+  rename("Community" = "Name",
+         "Obesity_rate" = "HCSOBP_2023-2024",
+         "Hypertension_rate" = "HCSHYTP_2023-2024", 
+         "Diabetes_rate" = "HCSDIAP_2023-2024",
+         "Asthma_rate" = "HCSATHP_2023-2024", 
+         "Cancer_diagnosis_rate" = "CCR_2017-2021", 
+         "Life_expectancy" = "VRLE_2023") %>% 
+  select(Community, Obesity_rate, Hypertension_rate, Diabetes_rate, Asthma_rate, Cancer_diagnosis_rate, Life_expectancy) %>% 
+  mutate_at(.vars = c(2:7), as.numeric) %>% 
+  mutate(across(2:7, round, 1)) %>% 
+  left_join((community_areas_sociodemo %>% distinct(Community, .keep_all = T) %>% select(Community, Neighborhood)), by = "Community") %>% 
+  select(8,1, 2:7)
+
+community_areas_sociodemo4 <- data.table::fread("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/CHA_Community_Areas_CT_v3.csv")[-c(1:4),] %>% 
+  rename("geoid" = "GEOID",
+         "pct_0_4" = "PCT-I_2019-2023",
+         "pct_0_17" = "PCT-C_2019-2023", 
+         "pct_65p" = "PCT-S_2019-2023") %>% 
+  select(geoid, pct_0_4, pct_0_17, pct_65p) %>% 
+  mutate_at(.vars = 2:4, as.numeric) %>% 
+  mutate(across(2:4, round, 1)) %>% 
+  inner_join(trt_community_areas, by = "geoid") %>% 
+  select(1,5,6,2:4)
+
+# Modify neighborhoods where NA appears due to spelling issues 
+community_areas_sociodemo3[community_areas_sociodemo3$Community == "McKinley Park", "Neighborhood"] <- "Southwest Side"
+community_areas_sociodemo3[community_areas_sociodemo3$Community == "O'Hare", "Neighborhood"] <- "Far North Side"
+
+# Daily estimates files path
+daily_pm25_trt_files <- list.files("~/Documents/CEHI/Chicago_Wildfire/Data/Output/PM25_Daily_Trt/",
+                                   pattern = "2020",
+                                   full.names = T)
+# Dates of available data
+days <- str_replace_all(seq.Date(as.Date("2023-05-01"), as.Date("2023-07-31"), by = "day"), "-", "")
+
+# Save tracts listed in all files 
+trt <- data.table::fread(daily_pm25_trt_files[1], colClasses = c("geoid" = "character"))[,1]
+
+# Calculate daily avg
+pm25_daily_avgs <- list()
+for (i in 1:length(daily_pm25_trt_files)) {
+  daily_pm25 <- data.table::fread(daily_pm25_trt_files[i], colClasses = c("geoid" = "character"))
+  
+  daily_pm25$PM25_Avg <- apply(daily_pm25[,2:25], FUN = mean, MARGIN = 1) # Calculate daily average based on hourly estimates
+  daily_pm25 <- daily_pm25[,c(26)] # Subset to variable created 
+  colnames(daily_pm25) <- paste0("PM25_Avg_", days[i]) # Change variable name according to date 
+  pm25_daily_avgs[[i]] <- daily_pm25 
+}
+
+# Save into df 
+pm25_daily_avgs <- cbind.data.frame(trt, pm25_daily_avgs)
+
+# Setup data in long format 
+pm25_long_fun <- function(df, values_to_label){
+  pm25_daily_long <- df %>% 
+    pivot_longer(cols = c(2:93), names_to = "Date", values_to = values_to_label) %>% 
+    mutate(Date = as.Date(factor(Date, labels = seq.Date(as.Date("2023-05-01"), as.Date("2023-07-31"), by = "day"))))
+  return(pm25_daily_long)
+}
+
+# Inner join with community areas 
+pm25_daily_avgs_long <- pm25_long_fun(pm25_daily_avgs, "PM25_Avg") %>% 
+  inner_join(trt_community_areas, by = "geoid") %>% 
+  mutate(Neighborhood = factor(Neighborhood, 
+                               levels = c("Southwest Side", "Far North Side", "Northwest Side", "North Side", "West Side", "Central",
+                                          "South Side", "Far Southwest Side", "Far Southeast Side")))
+
+```
+
+```{r community area map, fig.width=10}
+
+# Plot community area map 
+community_areas %>% 
+  mutate(Neighborhood = factor(Neighborhood, 
+                               levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central", "South Side",
+                                          "Southwest Side", "Far Southwest Side", "Far Southeast Side"))) %>%
+  ggplot() + 
+  geom_sf(aes(fill = Neighborhood), name = "Region", linewidth = 0.2, color = "black") +
+  scale_fill_brewer(palette = "Paired", name = "Region") +
+  theme_bw() +
+  theme(axis.line = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          #legend.position = "bottom",
+          #legend.direction = "vertical",
+          legend.text = element_text(size = 12),
+          legend.title = element_text(size = 14, face = "bold"),
+          plot.title = element_text(size = 16, face = "bold", hjust = 0.5)) + 
+  ggtitle(label = "City of Chicago: Community Areas and Region Definitions")
+
+```
+
+# Assessing sociodemographic composition of neighborhood areas
+
+```{r assessing sociodemographics of community areas and their respective neighborhoods}
+
+neighborhood_summary <- community_areas_sociodemo %>% 
+  group_by(Neighborhood) %>% 
+  summarise(Population = sum(Population),
+            pctNHwht = paste0(round(median(pctNHwht),digits = 1), " (", round(quantile(pctNHwht, 0.25), digits = 1), ", ", round(quantile(pctNHwht, 0.75), digits = 1), ")"),
+            pctNHblk = paste0(round(median(pctNHblk),digits = 1), " (", round(quantile(pctNHblk, 0.25), digits = 1), ", ", round(quantile(pctNHblk, 0.75), digits = 1), ")"),
+            pctHisp = paste0(round(median(pctHisp),digits = 1), " (", round(quantile(pctHisp, 0.25), digits = 1), ", ", round(quantile(pctHisp, 0.75), digits = 1), ")"),
+            Unemployment_rate = paste0(round(median(Unemployment_rate),digits = 1), " (", round(quantile(Unemployment_rate,0.25), digits = 1), ", ", round(quantile(Unemployment_rate, 0.75), digits = 1), ")"),
+            MedHHinc = paste0(round(median(MedHHinc, na.rm = T),digits = 1), " (", round(quantile(MedHHinc,0.25, na.rm = T), digits = 1), ", ", round(quantile(MedHHinc, 0.75, na.rm = T), digits = 1), ")"),
+            Poverty_rate = paste0(round(median(Poverty_rate),digits = 1), " (", round(quantile(Poverty_rate,0.25), digits = 1), ", ", round(quantile(Poverty_rate, 0.75), digits = 1), ")"), 
+            HS_grad_rate = paste0(round(median(HS_grad_rate),digits = 1), " (", round(quantile(HS_grad_rate,0.25), digits = 1), ", ", round(quantile(HS_grad_rate, 0.75), digits = 1), ")"),
+            Coll_grad_rate = paste0(round(median(Coll_grad_rate),digits = 1), " (", round(quantile(Coll_grad_rate,0.25), digits = 1), ", ", round(quantile(Coll_grad_rate, 0.75), digits = 1), ")"),
+            Uninsured_rate = paste0(round(median(Uninsured_rate),digits = 1), " (", round(quantile(Uninsured_rate,0.25), digits = 1), ", ", round(quantile(Uninsured_rate, 0.75), digits = 1), ")"),
+            COPD_rate = paste0(round(median(COPD_rate),digits = 1), " (", round(quantile(COPD_rate,0.25), digits = 1), ", ", round(quantile(COPD_rate, 0.75), digits = 1), ")"),
+            Disability_rate = paste0(round(median(Disability_rate),digits = 1), " (", round(quantile(Disability_rate,0.25), digits = 1), ", ", round(quantile(Disability_rate, 0.75), digits = 1), ")")) %>% 
+  ungroup() %>% 
+  rename("% NHW" = "pctNHwht",
+         "% NHB" = "pctNHblk",
+         "% Hispanic" = "pctHisp",
+         "% Unemployed" = "Unemployment_rate",
+         "% Poverty" = "Poverty_rate",
+         "HS grad rate" = "HS_grad_rate", 
+         "College grad rate" = "Coll_grad_rate",
+         "% Uninsured" = "Uninsured_rate",
+         "% COPD" = "COPD_rate",
+         "% Disability" = "Disability_rate")
+
+neighborhood_summary2 <- community_areas_sociodemo2 %>% 
+  mutate(Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central", "South Side",
+                                          "Southwest Side", "Far Southwest Side", "Far Southeast Side"))) %>% 
+  group_by(Neighborhood) %>% 
+  summarise(Medicaid_rate = paste0(round(median(Medicaid_rate, na.rm = T),digits = 1), " (", round(quantile(Medicaid_rate, 0.25, na.rm = T), digits = 1), ", ", round(quantile(Medicaid_rate, 0.75, na.rm = T), digits = 1), ")"),
+            Major_crimes = paste0(round(median(Major_crimes, na.rm = T),digits = 1), " (", round(quantile(Major_crimes, 0.25, na.rm = T), digits = 1), ", ", round(quantile(Major_crimes, 0.75, na.rm = T), digits = 1), ")"),
+            Eviction_rate = paste0(round(median(Eviction_rate, na.rm = T),digits = 1), " (", round(quantile(Eviction_rate, 0.25, na.rm = T), digits = 1), ", ", round(quantile(Eviction_rate, 0.75, na.rm = T), digits = 1), ")"),
+            Walkability_index = paste0(round(median(Walkability_index),digits = 1), " (", round(quantile(Walkability_index,0.25), digits = 1), ", ", round(quantile(Walkability_index, 0.75), digits = 1), ")"),
+            Rent_burdened_rate = paste0(round(median(Rent_burdened_rate, na.rm = T),digits = 1), " (", round(quantile(Rent_burdened_rate,0.25, na.rm = T), digits = 1), ", ", round(quantile(Rent_burdened_rate, 0.75, na.rm = T), digits = 1), ")"),
+            Ever_had_cancer_rate = paste0(round(median(Ever_had_cancer_rate, na.rm = T),digits = 1), " (", round(quantile(Ever_had_cancer_rate,0.25, na.rm = T), digits = 1), ", ", round(quantile(Ever_had_cancer_rate, 0.75, na.rm = T), digits = 1), ")"), 
+            Crowded_housing_rate = paste0(round(median(Crowded_housing_rate, na.rm = T),digits = 1), " (", round(quantile(Crowded_housing_rate,0.25, na.rm = T), digits = 1), ", ", round(quantile(Crowded_housing_rate, 0.75, na.rm = T), digits = 1), ")")) %>% 
+  ungroup() 
+
+neighborhood_summary3 <- community_areas_sociodemo3 %>% 
+  group_by(Neighborhood) %>% 
+  summarise(Obesity_rate = paste0(round(median(Obesity_rate, na.rm = T),digits = 1), " (", round(quantile(Obesity_rate, 0.25, na.rm = T), digits = 1), ", ", round(quantile(Obesity_rate, 0.75, na.rm = T), digits = 1), ")"),
+            Hypertension_rate = paste0(round(median(Hypertension_rate, na.rm = T),digits = 1), " (", round(quantile(Hypertension_rate, 0.25, na.rm = T), digits = 1), ", ", round(quantile(Hypertension_rate, 0.75, na.rm = T), digits = 1), ")"),
+            Diabetes_rate = paste0(round(median(Diabetes_rate, na.rm = T),digits = 1), " (", round(quantile(Diabetes_rate, 0.25, na.rm = T), digits = 1), ", ", round(quantile(Diabetes_rate, 0.75, na.rm = T), digits = 1), ")"),
+            Asthma_rate = paste0(round(median(Asthma_rate, na.rm = T),digits = 1), " (", round(quantile(Asthma_rate,0.25, na.rm = T), digits = 1), ", ", round(quantile(Asthma_rate, 0.75,  na.rm = T), digits = 1), ")"),
+            Cancer_diagnosis_rate = paste0(round(median(Cancer_diagnosis_rate, na.rm = T),digits = 1), " (", round(quantile(Cancer_diagnosis_rate,0.25, na.rm = T), digits = 1), ", ", round(quantile(Cancer_diagnosis_rate, 0.75, na.rm = T), digits = 1), ")"),
+            Life_expectancy = paste0(round(median(Life_expectancy, na.rm = T),digits = 1), " (", round(quantile(Life_expectancy,0.25, na.rm = T), digits = 1), ", ", round(quantile(Life_expectancy, 0.75, na.rm = T), digits = 1), ")")) %>% 
+  ungroup() 
+
+neighborhood_summary4 <- community_areas_sociodemo4 %>% 
+  mutate(Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central", "South Side",
+                                          "Southwest Side", "Far Southwest Side", "Far Southeast Side"))) %>% 
+  group_by(Neighborhood) %>% 
+  summarise(pct_0_4 = paste0(round(median(pct_0_4, na.rm = T),digits = 1), " (", round(quantile(pct_0_4, 0.25, na.rm = T), digits = 1), ", ", round(quantile(pct_0_4, 0.75, na.rm = T), digits = 1), ")"),
+             pct_0_17 = paste0(round(median(pct_0_17, na.rm = T),digits = 1), " (", round(quantile(pct_0_17, 0.25, na.rm = T), digits = 1), ", ", round(quantile(pct_0_17, 0.75, na.rm = T), digits = 1), ")"),
+             pct_65p = paste0(round(median(pct_65p, na.rm = T),digits = 1), " (", round(quantile(pct_65p, 0.25, na.rm = T), digits = 1), ", ", round(quantile(pct_65p, 0.75, na.rm = T), digits = 1), ")")) %>% 
+  ungroup()
+
+neighborhood_summary %>% kbl(caption = "Table 1. Mean (SD) of Sociodemographic Characteristics in Neighborhood Areas") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
+
+neighborhood_summary2 %>% kbl(caption = "Table 1 Continued") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
+
+neighborhood_summary3 %>% kbl(caption = "Table 1 Continued") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
+
+neighborhood_summary4 %>% kbl(caption = "Table 1 Continued") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
+
+```
+
+# Distribution of Daily PM2.5 concentrations 
+
+```{r daily pm25 concentrations, fig.width=10}
+
+pm25_daily_avgs_long %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = Date, y = PM25_Avg, group = Date), outlier.shape = NA) + 
+  scale_x_date(breaks = as.Date(c("2023-05-01", "2023-05-15", "2023-05-31", "2023-06-15", "2023-06-27", "2023-06-28", "2023-07-15", "2023-07-31")), 
+               labels = c("5/1", "5/15", "5/31", "6/15", "6/27-28", "", "7/15", "7/31")) +
+  geom_vline(aes(xintercept = as.Date("2023-06-27")), linetype = 2, size = 1.1, color = "firebrick") + 
+  geom_hline(aes(yintercept = 35), linetype = 2, size = 1.1, color = "green3") + 
+  geom_hline(aes(yintercept = 15.3), linetype = 2, size = 1.1, color = "steelblue") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 16),
+        axis.text.y = element_text(size = 16),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        plot.title = element_text(size = 18)) +
+     xlab("Date") + ylab("Daily Average PM2.5") #+ ggtitle(label = "Distribution of daily average tract-level PM2.5 concentrations", subtitle = "Vertical line represents the start of the peak WFS period.")
+
+```
+
+# Examining PM2.5 concentrations in neighborhoods at different points during the study period  
+
+## Daily comparisons 
+
+The table below shows daily average PM2.5 concentrations by neighborhood, and evaluates significant differences between them via a one-way ANOVA. The daily p-value associated with the one-way ANOVA is included in the table. 
+
+```{r assessing PM2.5 concentrations for community areas and their respective neighborhoods at different points during the study period - daily comparisons}
+
+# For each day, calculate mean and sd of pm2.5 exposure for each of the neighborhoods, and capture sig differences between neighborhoods 
+neighborhood_daily_avgs <- list()
+anova_pvals <- vector()
+for (i in unique(as.character(pm25_daily_avgs_long$Date))) {
+  pm25_day <- pm25_daily_avgs_long %>% filter(Date == as.Date(i))
+  neighborhood_daily_avgs[[i]] <- pm25_day %>% 
+    group_by(Neighborhood) %>% 
+    summarise(`PM2.5 Mean (SD)`= paste0(round(mean(PM25_Avg),1), " (", round(sd(PM25_Avg),1), ")")) %>% 
+    pivot_wider(names_from = Neighborhood, values_from = `PM2.5 Mean (SD)`)
+  
+  anova_pvals[i] <- round(summary(aov(PM25_Avg ~ Neighborhood, data = pm25_daily_avgs_long  %>% filter(Date == as.Date(i))))[[1]]$`Pr(>F)`[1],3)
+  
+}
+
+bind_rows(neighborhood_daily_avgs) %>% 
+  mutate(Date = format(seq.Date(from = as.Date("2023-05-01"), to = as.Date("2023-07-31"), by = "day"), "%m/%d"),
+        `p-value` = anova_pvals) %>% 
+  select(10, 1:9, 11) %>% 
+  kbl(caption = "Daily PM2.5 Mean (SD) Exposure by Neighborhood") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
+
+```
+
+## Period averages 
+
+* Below we highlight average PM2.5 concentrations at the neighborhood-level across the following time periods:
+    + Pre-peak WF days (May 1 - June 26)
+    + Peak WF days (June 27 - June 28)
+    + Post-peak WF days (June 29 - July 31)
+    
+```{r assessing PM2.5 concentrations for community areas and their respective neighborhoods at different points during the study period - period averages, fig.width=10}
+
+pm25_period_avgs <- pm25_daily_avgs_long %>% 
+  mutate(Period = factor(if_else(Date <= as.Date("2023-06-26"), "Pre-peak",
+                          if_else(Date >= as.Date("2023-06-27") & Date <= as.Date("2023-06-28"), "Peak", "Post-peak")),
+                         levels = c("Pre-peak", "Peak", "Post-peak")))
+
+# For each designated period, calculate mean and sd of pm2.5 exposure for each of the neighborhoods, and capture sig differences between neighborhoods 
+neighborhood_period_avgs <- list()
+anova_pvals <- vector()
+for (i in unique(as.character(pm25_period_avgs$Period))) {
+  pm25_period <- pm25_period_avgs %>% filter(Period == i)
+  neighborhood_period_avgs[[i]] <- pm25_period %>% 
+    group_by(Neighborhood) %>% 
+    summarise(`PM2.5 Mean (SD)`= paste0(round(mean(PM25_Avg),1), " (", round(sd(PM25_Avg),1), ")")) %>% 
+    pivot_wider(names_from = Neighborhood, values_from = `PM2.5 Mean (SD)`)
+  
+  anova_pvals[i] <- round(summary(aov(PM25_Avg ~ Neighborhood, data = pm25_period_avgs  %>% filter(Period == i)))[[1]]$`Pr(>F)`[1],3)
+  
+}
+
+bind_rows(neighborhood_period_avgs) %>% 
+  mutate(Period = c("Pre-peak", "Peak", "Post-peak"),
+         `p-value` = anova_pvals) %>% 
+  select(10, 1:9, 11) %>% 
+  kbl(caption = "PM2.5 Mean (SD) Exposure by Neighborhood for Designated Time Periods") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
+
+```
+
+### Spatial distribution 
+
+```{r assessing PM2.5 concentrations for community areas and their respective neighborhoods at different points during the study period - period averages - spatial dist, eval=FALSE}
+
+# Join pm2.5 period averages with tract boundaries 
+pm25_period_avgs_sf <- pm25_period_avgs %>%
+  group_by(geoid, Period) %>%
+  mutate(PM25_Avg = mean(PM25_Avg)) %>% 
+  distinct(geoid, .keep_all = T) %>%
+  ungroup() %>% 
+  mutate(Period2 = if_else(Period == "Peak", "Peak", "Non-Peak")) %>% 
+  inner_join(trt_boundaries, by = c("geoid", "Neighborhood")) %>% 
+  select(-Community.x, -Community.y) %>% 
+  group_by(Period2) %>% 
+  mutate(PM25_Avg = cut(PM25_Avg, quantile(PM25_Avg, seq(0,1,0.2)), include.lowest = T)) %>% 
+  ungroup() %>% 
+  mutate(PM25_Avg2 = str_replace_all(gsub("\\[|\\]|\\(|\\)", "", PM25_Avg), pattern = ",", replacement = " - ")) %>% 
+  st_as_sf()
+
+factor_levels <- pm25_period_avgs_sf %>% 
+  st_set_geometry(NULL) %>% 
+  group_by(PM25_Avg, PM25_Avg2) %>% 
+  distinct(PM25_Avg, .keep_all = F) %>% 
+  ungroup() %>% 
+  arrange(PM25_Avg)
+
+pm25_period_avgs_sf$PM25_Avg <- factor(pm25_period_avgs_sf$PM25_Avg, labels = factor_levels$PM25_Avg2)
+
+# Create map function 
+map_fun <- function(period, viridis_option){
+  period_file_name <- ifelse(period == "Pre-peak", "Pre-peak",
+                             ifelse(period == "Peak", "Peak", "Post-peak"))
+  
+  ggplot() + 
+    geom_sf(aes(fill = PM25_Avg), linewidth = 0.15, color = "black", data = pm25_period_avgs_sf %>% filter(Period == period)) + 
+    scale_fill_viridis_d(direction = -1, option = viridis_option, name = "PM2.5") +
+    theme_bw() +
+    theme(axis.line = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          #legend.position = "bottom",
+          #legend.direction = "vertical",
+          legend.text = element_text(size = 12),
+          legend.title = element_text(size = 14, face = "bold"),
+          plot.title = element_text(size = 16, face = "bold", hjust = 0.5)) + 
+     ggtitle(label = period)
+}
+
+map_fun("Pre-peak", "inferno")
+map_fun("Peak", "inferno")
+map_fun("Post-peak", "inferno")
+
+```
+
+# Modeling PM2.5 exposure using an ITS approach
+
+We model PM2.5 exposure using an ITS modeling approach to better compare exposure levels before, during, and directly after the start of the peak WF smoke.  
+
+* In its simplest form, the ITS model is specified as follows: 
+    + **Y = Beta0 + Beta1xT + Beta2xD + Beta3xP + e**, where:
+        + Beta0 is the baseline level of the outcome
+        + T = time variable passed from the start of the observation period
+            + Beta1 = slope of the line before the intervention 
+        + D = treatment variable where 1 is after the intervention and 0 is before the intervention
+            + Beta2 = **immediate effect** after the intervention 
+        + P = time variable indicating time passed since the intervention (before the intervention, the value is set to 0)
+            + Beta3 = **sustained effect** (i.e., difference between the slope of the line prior to the intervention and the slope of the line subsequent to the intervention)
+
+* For the purpose of this study, we define each of the three time covariates as follows:  
+    + Y = PM2.5 daily average 
+    + T = 1, 2, 3,..., 92 (represents sequential days from 5/1-7/31)
+    + D = 0 (all days before 6/27), 1 (all days after and including 6/27)
+        + We define the intervention as the first peak WF day (6/27)
+    + P = 0 (all days before 6/29); 1, 2, 3,..., 33 (represents sequential days from 6/29-7/31)
+    
+* Further model specifications:
+    + For all set of models, we include a random effect (random intercept) component for census tracts 
+    + To deal with likely time series related autocorrelation, we include a first-order autoregressive correlation structure in the model to allow for correlation of time 
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - setup data for modeling}
+
+# Set-up df for ITS 
+pm25_its_df <- pm25_daily_avgs_long
+
+pm25_its_df$Time <- as.numeric(as.factor(pm25_its_df$Date))
+pm25_its_df$Intervention <- as.factor(if_else(pm25_its_df$Date < as.Date("2023-06-27"), 0, 1))
+pm25_its_df$Post_Intervention_Time <- rep(c(rep(0,59), 1:33), length(unique(pm25_its_df$geoid)))
+
+```
+
+## ITS model via segmented linear regression
+
+Our base ITS model takes the form of a **segmented linear mixed-effects** model. 
+
+Below are the model results, and a plot of the fitted values. 
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - fit both sets of and save output model, eval=FALSE}
+
+base_mod <- lme(PM25_Avg ~ Time + Intervention + Post_Intervention_Time,
+                random = ~1|geoid,
+    correlation = corARMA(p = 1, q = 2, form = ~Time), 
+    data = pm25_its_df, method = "ML")
+
+base_mod2 <- lme(PM25_Avg ~ Time*Neighborhood + Intervention*Neighborhood + Post_Intervention_Time*Neighborhood,
+                random = ~1|geoid,
+    correlation = corARMA(p = 1, q = 2, form = ~Time), 
+    data = pm25_its_df, method = "ML")
+
+saveRDS(base_mod, "~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/base_mod_v2.rds")
+saveRDS(base_mod2, "~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/base_mod2_v3.rds")
+
+```
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - base model 1 results}
+
+base_mod <- readRDS("~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/base_mod_v2.rds")
+base_mod2 <- readRDS("~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/base_mod2_v3.rds")
+sjPlot::tab_model(base_mod, dv.labels = "PM2.5 Avg")
+
+```
+
+* **Interpretation of model results:**     
+    + Prior to the intervention (i.e., the first peak WF day), the average PM2.5 concentration was increasing by 0.06 units per day
+    + At the first peak WF day, there was a positive step change of 37.67, meaning that the average increase in PM2.5 for census tracts from 6/26-6/27 was ~38 units
+    + After the first peak WF day, average PM2.5 concentrations began decreasing -1.56 units per day 
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - base model figure}
+
+pm25_its_df %>% 
+  mutate(model_predictions = predictSE.lme(base_mod, ., se.fit=T)$fit,
+         model_se = predictSE.lme(base_mod, ., se.fit = T)$se) %>%
+  ggplot(aes(x = Time, PM25_Avg)) +
+  geom_ribbon(aes(ymin = model_predictions - (1.96*model_se),
+                  ymax = model_predictions + (1.96*model_se)), fill = "lightblue") + 
+  geom_line(aes(x  = Time, y = model_predictions), size = 0.8, color = "black") +
+  geom_vline(aes(xintercept = 58), linetype = 2) + 
+  geom_point(alpha = 0.1, color = "steelblue4") +
+  theme_bw() + 
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold")) + 
+  xlab("Time") + 
+  ylab("PM2.5 Avg") + 
+  ggtitle(label = "Base model: Observations vs. predicted values",
+          subtitle = "Blue points = Actual PM2.5 concentrations\nBlack line = Model fitted values\nDashed line = Start of the WF period (intervention)")
+
+```
+
+### Model with neighborhood interaction 
+
+To assess differences between neighborhoods in these associations, we interact each of the time covariates in the ITS model with neighborhood, using the Southwest Side as reference. 
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - int term for neighborhood}
+
+sjPlot::tab_model(base_mod2, dv.labels = "PM2.5 Avg")
+
+time_coef <- paste0("Time:Neighborhood", levels(pm25_its_df$Neighborhood))
+intervention_coef <- paste0("Neighborhood", levels(pm25_its_df$Neighborhood), ":Intervention1")
+post_intervention_coef <- paste0("Neighborhood", levels(pm25_its_df$Neighborhood), ":Post_Intervention_Time")
+
+
+# Pre-peak WFS plot 
+sjPlot::plot_model(base_mod2, type = "est", terms = time_coef) + 
+  scale_color_manual(values = c("blue", "red")) + 
+  geom_hline(aes(yintercept = 0), linetype = "dashed", color = "gray50") +
+  scale_x_discrete(labels = paste0("Pre-peak WFS:", rev(levels(pm25_its_df$Neighborhood)[-1]))) +
+  theme_bw() + 
+  theme(panel.grid = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14),
+        plot.title = element_text(size = 16)) + 
+  ylab("Coefficient Estimates") +
+  ggtitle(label = "Pre-peak WFS x Region") 
+
+# Peak WFS plot 
+sjPlot::plot_model(base_mod2, type = "est", terms = intervention_coef) + 
+  scale_color_manual(values = c("blue", "red")) + 
+  geom_hline(aes(yintercept = 0), linetype = "dashed", color = "gray50") +
+  scale_x_discrete(labels = paste0("Peak WFS:", rev(levels(pm25_its_df$Neighborhood)[-1]))) +
+  theme_bw() + 
+  theme(panel.grid = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_text(size = 17),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 22)) + 
+  ggtitle(label = "Peak WFS x Region") 
+
+# Post-peak WFS plot 
+sjPlot::plot_model(base_mod2, type = "est", terms = post_intervention_coef) + 
+  scale_color_manual(values = c("blue", "red")) + 
+  geom_hline(aes(yintercept = 0), linetype = "dashed", color = "gray50") +
+  scale_x_discrete(labels = paste0("Post-peak WFS:", rev(levels(pm25_its_df$Neighborhood)[-1]))) +
+  theme_bw() + 
+  theme(
+        panel.grid = element_blank(),
+        axis.title = element_text(size = 24),
+        axis.text = element_text(size = 17),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 22)) + 
+  ylab("Coefficient Estimates") +
+  ggtitle(label = "Post-peak WFS x Region") 
+
+```
+  
+## ITS model using GAM
+
+From our observed data, we know the time trend in the study is non-linear. Below, we use a GAM to accommodate the nonlinear trend in PM2.5 exposure. For each of the continuous time covariates - T and P - we apply thin plate regression splines (default smoothing function in R) with 4 and 5 knots, respectively. We choose 4 and 5 knots (default is 9), to avoid overfitting while still capturing the non-linear trend in the data. 
+
+Below are the results of the model and a plot of the fitted values. 
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - fit and save gam models, eval=FALSE}
+
+# Fit basic gam model
+gam_mod <- gamm(PM25_Avg ~ s(Time, k = 4) + Intervention + s(Post_Intervention_Time, k = 5),
+                random = list(geoid=~1),
+                correlation = corARMA(p = 1, q = 2, form = ~Time),
+                data = pm25_its_df, method = "ML")
+
+# Fit gam model with different smoothing parameters for each level of region (neighborhood)
+gam_mod2 <- gamm(PM25_Avg ~ s(Time, by = Neighborhood, k = 4) + Intervention*Neighborhood + s(Post_Intervention_Time, by = Neighborhood, k = 5),
+                random = list(geoid=~1),
+                correlation = corARMA(p = 1, q = 2, form = ~Time),
+                data = pm25_its_df, method = "ML")
+gam_mod3 <- gamm(PM25_Avg ~ s(Time, k = 4) + Intervention + s(Post_Intervention_Time, by = Neighborhood, k = 5),
+                random = list(geoid=~1),
+                correlation = corARMA(p = 1, q = 2, form = ~Time),
+                data = pm25_its_df, method = "ML")
+
+# Save models 
+saveRDS(gam_mod, "~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/gam_mod1_v8.rds")
+saveRDS(gam_mod2, "~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/gam_mod2_v9.rds")
+saveRDS(gam_mod3, "~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/gam_mod3_v2.rds")
+
+```
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - display model results and plot, fig.width=10}
+
+gam_mod <- readRDS("~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/gam_mod1_v8.rds")
+gam_mod2 <- readRDS("~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/gam_mod2_v9.rds") 
+gam_mod3 <- readRDS("~/Documents/CEHI/Chicago_Wildfire/Data/Output/Models/gam_mod3_v2.rds") 
+
+pm25_its_df %>% 
+  mutate(model_predictions = predict.gam(gam_mod$gam, ., se.fit=T)$fit,
+         model_se = predict.gam(gam_mod$gam, ., se.fit = T)$se) %>%
+  ggplot(aes(x = Date, PM25_Avg)) +
+  geom_ribbon(aes(ymin = model_predictions - (1.96*model_se),
+                  ymax = model_predictions + (1.96*model_se)), fill = "lightblue") + 
+  geom_line(aes(x  = Date, y = model_predictions), size = 0.8, color = "black") +
+  scale_x_date(breaks = as.Date(c("2023-05-01", "2023-05-15", "2023-05-31", "2023-06-15", "2023-06-27", "2023-07-15", "2023-07-31")), date_labels = "%m/%d") +
+  geom_vline(aes(xintercept = as.Date("2023-06-27")), linetype = 2, size = 1, color = "forestgreen") + 
+  geom_hline(aes(yintercept = 35), linetype = 4, size = 1, color = "firebrick4") + 
+  geom_point(alpha = 0.1, color = "steelblue4") +
+  theme_bw() + 
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(size = 16, face = "bold"),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18, face = "bold")) + 
+  xlab("Time") + 
+  ylab("PM2.5 Average") + 
+  ggtitle(label = "GAM: Observations vs. predicted values")
+
+```
+
+### ITS model using GAM: Allowing smoothing parameters to vary between neighborhoods 
+
+Using GAM, we can allow the smoothing parameters to vary between neighborhoods, allowing us to compare PM2.5 exposure levels between neighborhoods at different points in time. 
+
+Below are the model results and the plot of the fitted values. 
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - allowing smoothing parameters to vary between neighborhoods - display model results and plot, fig.width=12}
+
+summary(gam_mod2$gam)
+
+pm25_its_df %>% 
+  mutate(model_predictions = predict.gam(gam_mod2$gam, ., se.fit=T)$fit,
+         model_se = predict.gam(gam_mod2$gam, ., se.fit = T)$se) %>%
+  ggplot(aes(x = Date, PM25_Avg)) +
+  geom_ribbon(aes(ymin = model_predictions - (1.96*model_se),
+                  ymax = model_predictions + (1.96*model_se)), fill = "lightblue") + 
+  geom_line(aes(x  = Date, y = model_predictions, color = Neighborhood), size = 1.1) +
+  scale_x_date(breaks = as.Date(c("2023-05-01", "2023-05-15", "2023-05-31", "2023-06-15", "2023-06-27", "2023-07-15", "2023-07-31")), date_labels = "%m/%d") + 
+  geom_vline(aes(xintercept = as.Date("2023-06-27")), linetype = 2, size = 1.2, color = "forestgreen") + 
+  geom_hline(aes(yintercept = 35), linetype = 4, size = 1.2, color = "firebrick4") + 
+  geom_point(alpha = 0.1, color = "steelblue4") +
+  theme_bw() + 
+  theme(panel.grid = element_blank(), 
+        axis.text = element_text(size = 17),
+        axis.title = element_text(size = 22, face = "bold"),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 22)) + 
+  labs(color = "Region") +
+  xlab("Date") + 
+  ylab("Daily Average PM2.5")
+
+
+# Plot intervention x Neighborhood interaction 
+model_coefficients <- summary(gam_mod2$gam)[["p.coeff"]][11:18]
+model_standard_errors <- summary(gam_mod2$gam)[["se"]][11:18]
+
+data.frame(Region = factor(levels(pm25_its_df$Neighborhood)[-1], levels = levels(pm25_its_df$Neighborhood)[-1]),
+           Coefficient = unname(model_coefficients),
+           SE = unname(model_standard_errors),
+           Lower_CI = unname(model_coefficients)  - 1.96*unname(model_standard_errors),
+           Upper_CI = unname(model_coefficients)  + 1.96*unname(model_standard_errors)) %>% 
+  ggplot(aes(x = Region, y = Coefficient, color = Region, group = Region)) + 
+  geom_point(size = 4) + 
+  geom_errorbar(aes(ymin=Lower_CI, ymax=Upper_CI), width = 0.4, size = 1.3) + 
+  geom_hline(aes(yintercept = 0), linetype = 2, size = 2) + 
+  scale_color_brewer(palette = "Dark2") +
+  scale_y_continuous(limits = c(-8.2, 6), breaks = seq(-8,5,2)) + 
+  annotate("text", x = 1.4, y = 6, label = "- - - Southwest Side", 
+           color = "black", size = 10) + 
+  theme_bw() + 
+  theme(#panel.grid = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(size = 26, angle = 20, vjust = 0.65),
+        axis.text.y = element_text(size = 26),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 28))# +
+  #ylab("Difference in PM2.5") 
+
+```
+
+#### Assessing pairwise differences between neighborhood smooth interactions 
+
+```{r modeling PM2.5 exposure using an interrupted time series approach - allowing smoothing parameters to vary between neighborhoods - assessing pairwise differences between neighborhood smooth interactions - setup and display data, fig.width=12, fig.height=8}
+
+# Calculate difference in smooths between pre-peak and post-peak 
+sm_dif_time <- difference_smooths(gam_mod2, select = "s(Time)", group_means = T) %>% filter(Time <= 57) 
+sm_dif_postint <- difference_smooths(gam_mod3, select = "s(Post_Intervention_Time)", group_means = T) %>%
+  filter(Post_Intervention_Time >= 1 & Post_Intervention_Time <= 33)
+
+  
+sm_dif_time_opposite <- sm_dif_time %>% 
+  select(1:2,4,3,5:6,8,7,9) %>% 
+  rename(.level_1 = .level_2,
+         .level_2 = .level_1,
+         .upper_ci = .lower_ci,
+         .lower_ci = .upper_ci) %>% 
+  mutate(.diff = .diff*-1,
+         .lower_ci = .lower_ci*-1,
+         .upper_ci = .upper_ci*-1)
+
+sm_dif_postint_opposite <- sm_dif_postint %>% 
+  select(1:2,4,3,5:6,8,7,9) %>% 
+  rename(.level_1 = .level_2,
+         .level_2 = .level_1,
+         .upper_ci = .lower_ci,
+         .lower_ci = .upper_ci) %>% 
+  mutate(.diff = .diff*-1,
+         .lower_ci = .lower_ci*-1,
+         .upper_ci = .upper_ci*-1)
+
+sm_dif_fun <- function(time_covariate, neighborhood){
+  sm_dif_objs <- if(time_covariate == "Time"){
+     list(sm_dif_time, sm_dif_time_opposite)
+   } else {
+     list(sm_dif_postint, sm_dif_postint_opposite)
+   }
+  
+  sm_dif_neighborhood <- sm_dif_objs[[1]] %>% filter(.level_1 == neighborhood)
+  # Save neighborhood comparisons not captured 
+  all_neighborhoods <- as.character(unique(pm25_daily_avgs_long$Neighborhood))
+  missing_comparisons <- all_neighborhoods[!all_neighborhoods %in% c(unique(sm_dif_neighborhood$.level_2), neighborhood)]
+  # For those missing comparisons, index the appropriate opposite df created above 
+  comparisons_to_add <- sm_dif_objs[[2]] %>% 
+    filter(.level_1 == neighborhood & .level_2 %in% c(missing_comparisons))
+  
+  # Bind rows to capture all comparisons in 1 df 
+  bind_rows(sm_dif_neighborhood, comparisons_to_add)
+}
+
+# Run function across all neighborhoods, and for both time covariates included in the GAM 
+sm_dif_time_list <- list()
+sm_dif_postint_list <- list()
+for (i in as.character(unique(pm25_daily_avgs_long$Neighborhood))) {
+  sm_dif_time_list[[i]] <- sm_dif_fun("Time", i)
+  sm_dif_postint_list[[i]] <- sm_dif_fun("Post_Intervention_Time", i)
+}
+
+# Bind rows 
+sm_dif_time_df <- bind_rows(sm_dif_time_list)
+sm_dif_postint_df <- bind_rows(sm_dif_postint_list) %>% rename(Time = Post_Intervention_Time)
+
+# Combine both pre-peak and post-peak dfs 
+sm_dif <- bind_rows(sm_dif_time_df, sm_dif_postint_df) %>% 
+  rename("Period" = ".smooth") %>% 
+  mutate(Period = factor(if_else(Period == "s(Time)", "Pre-peak", "Post-peak"), levels = c("Pre-peak", "Post-peak"))) 
+
+# Create pairwise difference plot function to output plots more easily 
+pairwise_diff_plot_fun <- function(ref_neighborhood){
+  sm_dif %>% 
+    mutate(.level_1 = factor(.level_1, levels = levels(pm25_daily_avgs_long$Neighborhood))) %>% 
+    filter(.level_2 == ref_neighborhood) %>% 
+    ggplot(aes(x = Time, y = .diff, color = Period)) + 
+    geom_line() +
+    geom_ribbon(aes(ymin = .lower_ci, ymax = .upper_ci, fill = Period), alpha=0.1) + 
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") + 
+    scale_color_brewer(palette = "Dark2") +
+    scale_fill_brewer(palette = "Dark2") +
+    scale_x_continuous(breaks = seq(0,57,10)) +
+    theme_bw() + 
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 18),
+          legend.title = element_text(size = 18, face = "bold"),
+          panel.grid = element_blank(),
+          axis.title = element_text(size = 18, face = "bold"),
+          axis.text = element_text(size = 18),
+          plot.caption = element_text(hjust = 0, size = 12),
+          strip.text = element_text(size = 18, face = "bold")) +
+    facet_wrap(~.level_1) + 
+    ylab("Difference") + 
+    xlab("Time, days") + 
+    labs(caption =  paste0("Horizontal vertical line = ", ref_neighborhood, "\nPre-peak period = May 1 - June 26 (57 days)\nPost-peak period = June 29 - July 31 (33 days)"))
+}
+
+# Output plots for Southwest Side and Far Southwest Side
+pairwise_diff_plot_fun("Southwest Side")
+pairwise_diff_plot_fun("Far Southwest Side")
+
+```
+
+# Figure showing how many days it took to return to baseline by region 
+
+```{r figure showing how many days it took to return to baseline by region, fig.width=10}
+
+# First, let's calculate overall average pre-peak WFS PM2.5 concentrations 
+pre_peak_overall_avg <- as.numeric(pm25_its_df %>% 
+  filter(Date <= as.Date("2023-06-26")) %>% 
+  summarise(PM25_Avg = mean(PM25_Avg)))
+
+
+return_to_baseline <- pm25_its_df %>% 
+  filter(Date >= as.Date("2023-06-27")) %>% 
+  group_by(Neighborhood, Date) %>%
+  summarise(PM25_Avg = mean(PM25_Avg)) %>% 
+  ungroup() %>% 
+  group_by(Neighborhood) %>% 
+  mutate(PM25_3day_MA = rollmean(PM25_Avg, k = 3, fill = NA, align = "right")) %>% 
+  ungroup() %>% 
+  drop_na() %>% 
+  filter(Date <= as.Date("2023-07-08")) %>% 
+  mutate(vline_pos = if_else(Neighborhood == "Southwest Side", as.Date("2023-07-07"),
+                             if_else(Neighborhood == "Far North Side", as.Date("2023-07-03"),
+                                     if_else(Neighborhood == "Northwest Side", as.Date("2023-07-03"), 
+                                             if_else(Neighborhood == "North Side", as.Date("2023-07-03"),
+                                                     if_else(Neighborhood == "West Side", as.Date("2023-07-03"),
+                                                             if_else(Neighborhood == "Central", as.Date("2023-07-07"),
+                                                                     if_else(Neighborhood == "South Side", as.Date("2023-07-07"),
+                                                                             if_else(Neighborhood == "Far Southwest Side", as.Date("2023-07-08"), as.Date("2023-07-07"))))))))))
+
+return_to_baseline %>% 
+  mutate(Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central", "Southwest Side", "South Side", "Far Southwest Side", "Far Southeast Side"))) %>% 
+  ggplot(aes(x = Date, y = PM25_3day_MA)) + 
+  geom_point(size = 2) + 
+  geom_line() + 
+  geom_hline(aes(yintercept = pre_peak_overall_avg), size = 1.2, linetype = "dashed") + 
+  facet_wrap(~Neighborhood) + 
+  geom_vline(aes(xintercept = vline_pos), size = 1.2, color = "red", linetype = "dashed") + 
+  scale_x_date(breaks = unique(return_to_baseline$Date), labels = as.character(3:12)) + 
+  theme_bw() + 
+  theme(panel.grid = element_blank(),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12),
+        strip.text = element_text(size = 14, face = "bold")) + 
+  xlab("Days After the Start of the Peak WFS Period") + 
+  ylab("PM2.5 3-Day Moving Average")
+
+```
+
+# Supplemental figure showing difference in PM2.5 concentrations by region with a reference value of 35 ug/m3
+
+```{r supp figure, fig.width=10}
+
+pm25_period_avgs %>% 
+  group_by(Date, Period, Neighborhood) %>% 
+  summarise(PM25_Avg = mean(PM25_Avg)) %>%
+  ungroup() %>% 
+  mutate(Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central", "Southwest Side", "South Side", "Far Southwest Side", "Far Southeast Side")),
+         Difference = PM25_Avg - 35) %>% 
+  ggplot(aes(x = Date, y = Difference)) + 
+  geom_line(size = 1.2) + 
+  scale_x_date(breaks = as.Date(c("2023-05-01", "2023-05-15", "2023-05-31", "2023-06-15", "2023-06-27", "2023-06-28", "2023-07-15", "2023-07-31")), 
+               labels = c("5/1", "5/15", "5/31", "6/15", "6/27-28", "", "7/15", "7/31")) +
+  geom_vline(aes(xintercept = as.Date("2023-06-27")), linetype = 2, size = 1.2, color = "firebrick") +
+  geom_hline(aes(yintercept = 0), linetype = 2, size = 1.2, color = "steelblue3") +
+  facet_wrap(~Neighborhood) + 
+  theme_bw() + 
+  theme(legend.title = element_text(size = 14, face = "bold"),
+        panel.grid = element_blank(),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12),
+        strip.text = element_text(size = 14, face = "bold")) + 
+  ylab("Difference in PM2.5")
+
+```

@@ -1,0 +1,293 @@
+---
+title: 'Chicago Wildfire: PM2.5 Exposure Levels Across Sociodemographic Groups'
+author: "Aaron Lilienfeld"
+fig_width: 6
+output:
+  html_document:
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  word_document:
+    toc: yes
+    toc_depth: 4
+fig_height: 4
+---
+
+# Program background
+
+* **Script name**: CW_Daily_PM25_Exposure_SES_ITS.RMD
+
+* **Project name**: Chicago Wildfire 
+   
+* **Program description**: This program is meant to examine PM2.5 exposure among sociodemographic groups across the study period. 
+
+* **Data**: 
+
+* **Restrictions**:
+   
+* **Outline of program/analysis**:
+
+* **Author**:	Aaron Lilienfeld         				
+
+* **Date**:  
+
+* **Revisions (by/date)**:
+
+* **Input files**:
+
+* **Output files**:
+ 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, comment = NA, fig.width = 10)
+options(scipen = 999)
+```
+
+```{r load library}
+
+library("tidyverse")
+library("sf")
+library("gt")
+library("nlme")
+library("AICcmodavg")
+library("mgcv")
+
+```
+
+```{r load and process data, include=FALSE}
+
+# Create neighborhood objects 
+far_north_side <- toupper(c("Ohare", "O'HARE", "Norwood Park", "Edison Park", "Jefferson Park", "Forest Glen",
+                            "North Park", "Albany Park", "Lincoln Square", "West Ridge", "Edgewater", "Rogers Park", "Uptown"))
+northwest_side <- toupper(c("Dunning", "Montclare", "Belmont Cragin", "Hermosa", "Irving Park", "Portage Park"))
+north_side <- toupper(c("Logan Square", "Avondale", "North Center", "Lake View", "Lincoln Park"))
+west_side <- toupper(c("Austin", "Humboldt Park", "West Town", "West Garfield Park", "East Garfield Park", "Near West Side",
+                       "North Lawndale", "South Lawndale", "Lower West Side"))
+central <- toupper(c("Near North Side", "Loop", "Near South Side"))
+southwest_side <- toupper(c("Garfield Ridge", "Clearing", "Archer Heights", "West Elsdon", "West Lawn",
+                            "Chicago Lawn", "Gage Park", "Brighton Park", "McKinley Park", "New City",
+                            "West Englewood", "Englewood"))
+south_side <- toupper(c("Bridgeport", "Armour Square", "Douglas", "Fuller Park", "Grand Boulevard", "Greater Grand Crossing",
+                        "Washington Park", "Kenwood", "Hyde Park", "Woodlawn", "South Shore", "Oakland"))
+far_southwest_side <- toupper(c("Ashburn", "Auburn Gresham", "Beverly", "Mount Greenwood", "Morgan Park", "Washington Heights"))
+far_southeast_side <- toupper(c("Chatham", "Roseland", "West Pullman", "Avalon Park", "Burnside",
+                                "Pullman", "Riverdale", "Hegewisch", "South Deering", "South Chicago", "East Side", "Calumet Heights"))
+
+# Load tract to community areas definition
+trt_community_areas <- data.table::fread("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/Trt_Chicago_Community_Areas_2020.csv", 
+                                         colClasses = c("GEOID20" = "character")) %>% 
+  rename("geoid" = "GEOID20",
+         "Community" = "COMMUNIT_1") %>% 
+  mutate(Community = toupper(Community),
+         Neighborhood = if_else(Community %in% far_north_side, "Far North Side",
+                          if_else(Community %in% northwest_side, "Northwest Side", 
+                                  if_else(Community %in% north_side, "North Side",
+                                          if_else(Community %in% west_side, "West Side", 
+                                                  if_else(Community %in% central, "Central", 
+                                                          if_else(Community %in% southwest_side, "Southwest Side", 
+                                                                  if_else(Community %in% south_side, "South Side",
+                                                                          if_else(Community %in% far_southeast_side, "Far Southeast Side", 
+                                                                                  if_else(Community %in% far_southwest_side, "Far Southwest Side", NA)))))))))) %>% 
+  select(1,3,4) 
+
+# Load tract shapefile 
+trt_boundaries <- st_read("~/Documents/CEHI/Chicago_Wildfire/Data/tl_2020_17031_tract20/tl_2020_17031_tract20.shp") %>% 
+  filter(ALAND20 != 0) %>% 
+  rename("geoid" = "GEOID20") %>% 
+  select(geoid) %>% 
+  inner_join(trt_community_areas, by = "geoid") %>% 
+  mutate(Community = str_to_title(Community),
+         Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central",
+                                          "South Side", "Southwest Side", "Far Southwest Side", "Far Southeast Side"))) %>% 
+  st_set_crs(value = 26971) # NAD83 StatePlane Illinois East FIPS 1201
+
+# Load Chicago community areas .shp file 
+community_areas <- st_read("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/geo_export_933d2c08-f55b-413e-b529-b6b061fe738d.shp") %>% 
+  st_set_crs(value = 26971) %>% 
+  rename("Community" = "community") %>% 
+  mutate(Neighborhood = if_else(Community %in% far_north_side, "Far North Side",
+                          if_else(Community %in% northwest_side, "Northwest Side", 
+                                  if_else(Community %in% north_side, "North Side",
+                                          if_else(Community %in% west_side, "West Side", 
+                                                  if_else(Community %in% central, "Central", 
+                                                          if_else(Community %in% southwest_side, "Southwest Side", 
+                                                                  if_else(Community %in% south_side, "South Side",
+                                                                          if_else(Community %in% far_southeast_side, "Far Southeast Side", 
+                                                                                  if_else(Community %in% far_southwest_side, "Far Southwest Side", NA)))))))))) %>% 
+  select(Community, Neighborhood)
+
+community_areas$Community[community_areas$Community == "OHARE"] <- "O'HARE"
+
+# Chicago Health Atlas
+community_areas_sociodemo <- data.table::fread("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/CHA_Community_Areas_CT.csv")[-c(1:4),] %>% 
+  rename("geoid" = "GEOID",
+         "Uninsured_rate" = "UNS_2018-2022",
+         "COPD_rate" = "LNG_2021",
+         "Disability_rate" = "DIS_2018-2022",
+         "Unemployment_rate" = "UMP_2018-2022",
+         "pctNHwht" = "PCT-W_2018-2022",
+         "pctNHblk" = "PCT-B_2018-2022",
+         "pctHisp" = "PCT-H_2018-2022",
+         "HS_grad_rate" = "EDB_2018-2022",
+         "Coll_grad_rate" =  "EDE_2018-2022",
+         "Poverty_rate" = "POV_2018-2022",
+         "MedHHinc" = "INC_2018-2022") %>% 
+  select(3,13:15,10:12,8:9,5:7) %>% 
+  mutate_at(.vars = c(2:12), as.numeric) %>% 
+  mutate(across(2:12, round, 1)) %>% 
+  inner_join(trt_community_areas, by = "geoid") %>% 
+  select(1,13,14,2:12) %>% 
+  mutate(Community = str_to_title(Community),
+         Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central",
+                                          "South Side", "Southwest Side", "Far Southwest Side", "Far Southeast Side")))
+
+# Daily estimates files path
+daily_pm25_trt_files <- list.files("~/Documents/CEHI/Chicago_Wildfire/Data/Output/PM25_Daily_Trt/",
+                                   pattern = "2020",
+                                   full.names = T)
+# Dates of available data
+days <- str_replace_all(seq.Date(as.Date("2023-05-01"), as.Date("2023-07-31"), by = "day"), "-", "")
+
+# Save tracts listed in all files 
+trt <- data.table::fread(daily_pm25_trt_files[1], colClasses = c("geoid" = "character"))[,1]
+
+# Calculate daily avg
+pm25_daily_avgs <- list()
+for (i in 1:length(daily_pm25_trt_files)) {
+  daily_pm25 <- data.table::fread(daily_pm25_trt_files[i], colClasses = c("geoid" = "character"))
+  
+  daily_pm25$PM25_Avg <- apply(daily_pm25[,2:25], FUN = mean, MARGIN = 1) # Calculate daily average based on hourly estimates
+  daily_pm25 <- daily_pm25[,c(26)] # Subset to variable created 
+  colnames(daily_pm25) <- paste0("PM25_Avg_", days[i]) # Change variable name according to date 
+  pm25_daily_avgs[[i]] <- daily_pm25 
+}
+
+# Save into df 
+pm25_daily_avgs <- cbind.data.frame(trt, pm25_daily_avgs)
+
+# Setup data in long format 
+pm25_long_fun <- function(df, values_to_label){
+  pm25_daily_long <- df %>% 
+    pivot_longer(cols = c(2:93), names_to = "Date", values_to = values_to_label) %>% 
+    mutate(Date = as.Date(factor(Date, labels = seq.Date(as.Date("2023-05-01"), as.Date("2023-07-31"), by = "day"))))
+  return(pm25_daily_long)
+}
+
+# Inner join with community areas 
+pm25_daily_avgs_long <- pm25_long_fun(pm25_daily_avgs, "PM25_Avg") %>% 
+  inner_join(trt_community_areas, by = "geoid") %>% 
+  mutate(Neighborhood = factor(Neighborhood, 
+                               levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central",
+                                          "South Side", "Southwest Side", "Far Southwest Side", "Far Southeast Side")))
+```
+
+# Assessing PM2.5 exposure levels pre-peak, peak, and post-peak wildfire smoke period across quartiles/quintiles of sociodemographic groups 
+
+* As a reminder:
+    + Pre-peak = May 1 - June 26 
+    + Peak = June 27 - June 28 
+    + Post-peak = June 29 - July 31
+
+```{r process data for analysis - bin sociodemographic variables into quartiles/quintiles and join with daily average PM2.5 concentrations}
+
+ses_quartiles <- community_areas_sociodemo
+ses_quintiles <- community_areas_sociodemo
+
+for (i in names(community_areas_sociodemo)[4:14]) {
+  ses_quartiles[[i]] <- cut(ses_quartiles[[i]],
+                            quantile(ses_quartiles[[i]], seq(0,1,0.25), na.rm = T),
+                            include.lowest = T, 
+                            labels = c("Q1", "Q2", "Q3", "Q4"))
+  ses_quintiles[[i]] <- cut(ses_quintiles[[i]],
+                            quantile(ses_quintiles[[i]], seq(0,1,0.2), na.rm = T),
+                            include.lowest = T,
+                            labels = c("Q1", "Q2", "Q3", "Q4", "Q5"))
+}
+
+# Join with daily PM2.5 
+pm25_daily_avgs_quartiles <- pm25_daily_avgs_long %>%
+  select(-Community, -Neighborhood) %>% 
+  inner_join(ses_quartiles, by = "geoid") %>%
+  mutate(Period = factor(if_else(Date <= as.Date("2023-06-26"), "Pre-peak",
+                            if_else(Date >= as.Date("2023-06-29"), "Post-peak", "Peak")), levels = c("Pre-peak", "Peak", "Post-peak"))) 
+
+pm25_daily_avgs_quintiles <- pm25_daily_avgs_long %>% 
+  select(-Community, -Neighborhood) %>% 
+  inner_join(ses_quintiles, by = "geoid") %>% 
+  mutate(Period = factor(if_else(Date <= as.Date("2023-06-26"), "Pre-peak",
+                            if_else(Date >= as.Date("2023-06-29"), "Post-peak", "Peak")), levels = c("Pre-peak", "Peak", "Post-peak")))
+
+# Calculate ANOVA p-values 
+anova_fun <- function(df, var, period){
+  anova_formula <- as.formula(paste0("PM25_Avg ~ ", var))
+  anova_pvalue <- round(summary(aov(anova_formula, data = df %>% filter(Period == period)))[[1]]$`Pr(>F)`[1],3)
+  return(anova_pvalue)
+}
+
+
+pvals_quartiles_list <- list()
+pvals_quintiles_list <- list()
+for (i in names(pm25_daily_avgs_quartiles)[6:16]) {
+ pvals_quartiles_list[[i]] <- c(anova_fun(pm25_daily_avgs_quartiles, var = i, period = "Pre-peak"), 
+                                anova_fun(pm25_daily_avgs_quartiles, var = i, period = "Peak"),
+                                anova_fun(pm25_daily_avgs_quartiles, var = i, period = "Post-peak"))
+ 
+pvals_quintiles_list[[i]] <- c(anova_fun(pm25_daily_avgs_quintiles, var = i, period = "Pre-peak"), 
+                                anova_fun(pm25_daily_avgs_quintiles, var = i, period = "Peak"),
+                                anova_fun(pm25_daily_avgs_quintiles, var = i, period = "Post-peak"))
+}
+
+```
+
+## Quartiles 
+
+```{r setup table and output - quartiles}
+
+summary_fun <- function(df, var){
+  var <- enquo(var)
+  df %>% 
+    group_by(Period, !!var) %>% 
+    summarise(PM25_Avg = paste0(round(mean(PM25_Avg), digits = 1), "(", round(sd(PM25_Avg), digits = 1), ")")) %>% 
+    ungroup()
+}
+
+# Run function across variables 
+# Save into list 
+summary_dfs_quartiles_list <- list()
+summary_dfs_quintiles_list <- list()
+for (i in names(pm25_daily_avgs_quintiles)[6:16]) {
+  summary_dfs_quartiles_list[[i]] <- summary_fun(pm25_daily_avgs_quartiles, var = get(i)) 
+  summary_dfs_quintiles_list[[i]] <- summary_fun(pm25_daily_avgs_quintiles, var = get(i)) 
+}
+
+# Output table cleanly 
+summary_dfs_quartiles_clean_list <- list()
+summary_dfs_quintiles_clean_list <- list()
+for (i in 1:length(summary_dfs_quartiles_list)) {
+ summary_dfs_quartiles_clean_list[[i]] <- summary_dfs_quartiles_list[[i]] %>% 
+    pivot_wider(names_from = `get(i)`, values_from = PM25_Avg) %>%
+    mutate(`ANOVA p-val` = pvals_quartiles_list[[i]]) %>% 
+    gt() %>% 
+    tab_header(title = paste0("Average (SD) PM2.5 concentrations across quartiles of ", names(summary_dfs_quartiles_list)[i]))
+ 
+  summary_dfs_quintiles_clean_list[[i]] <- summary_dfs_quintiles_list[[i]] %>% 
+    pivot_wider(names_from = `get(i)`, values_from = PM25_Avg) %>%
+    mutate(`ANOVA p-val` = pvals_quintiles_list[[i]]) %>% 
+    gt() %>% 
+    tab_header(title = paste0("Average (SD) PM2.5 concentrations across quintiles of ", names(summary_dfs_quintiles_list)[i]))
+}
+
+summary_dfs_quartiles_clean_list[[1]];summary_dfs_quartiles_clean_list[[2]];summary_dfs_quartiles_clean_list[[3]];summary_dfs_quartiles_clean_list[[4]];summary_dfs_quartiles_clean_list[[5]];summary_dfs_quartiles_clean_list[[6]];summary_dfs_quartiles_clean_list[[7]];summary_dfs_quartiles_clean_list[[8]];summary_dfs_quartiles_clean_list[[9]];summary_dfs_quartiles_clean_list[[10]];summary_dfs_quartiles_clean_list[[11]]
+
+```
+
+## Quintiles 
+
+```{r setup table and output - quintiles}
+
+summary_dfs_quintiles_clean_list[[1]];summary_dfs_quintiles_clean_list[[2]];summary_dfs_quintiles_clean_list[[3]];summary_dfs_quintiles_clean_list[[4]];summary_dfs_quintiles_clean_list[[5]];summary_dfs_quintiles_clean_list[[6]];summary_dfs_quintiles_clean_list[[7]];summary_dfs_quintiles_clean_list[[8]];summary_dfs_quintiles_clean_list[[9]];summary_dfs_quintiles_clean_list[[10]];summary_dfs_quintiles_clean_list[[11]]
+
+```
