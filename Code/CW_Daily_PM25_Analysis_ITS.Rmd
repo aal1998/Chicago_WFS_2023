@@ -127,7 +127,7 @@ community_areas$Community[community_areas$Community == "OHARE"] <- "O'HARE"
 
 
 # Chicago Health Atlas data 
-# There are 4 separate data files to read in 
+# There are 5 separate data files to read in 
 community_areas_sociodemo <- data.table::fread("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/CHA_Community_Areas_CT.csv")[-c(1:4),] %>% 
   rename("geoid" = "GEOID",
          "Uninsured_rate" = "UNS_2018-2022",
@@ -189,6 +189,12 @@ community_areas_sociodemo4 <- data.table::fread("~/Documents/CEHI/Chicago_Wildfi
   mutate(across(2:4, round, 1)) %>% 
   inner_join(trt_community_areas, by = "geoid") %>% 
   select(1,5,6,2:4)
+
+community_areas_sociodemo5 <- readxl::read_excel("~/Documents/CEHI/Chicago_Wildfire/Data/Chicago_Community_Areas/CHA_Community_Areas_CT_v4.xlsx", sheet = 1) %>% 
+  rename("Community" = "Name",
+         "ADMR" = "VRADR_2020-2024") %>% 
+  mutate(Community = toupper(Community)) %>% 
+  inner_join(community_areas, by = "Community")
 
 # Modify neighborhoods where NA appears due to spelling issues 
 community_areas_sociodemo3[community_areas_sociodemo3$Community == "McKinley Park", "Neighborhood"] <- "Southwest Side"
@@ -326,6 +332,13 @@ neighborhood_summary4 <- community_areas_sociodemo4 %>%
              pct_65p = paste0(round(median(pct_65p, na.rm = T),digits = 1), " (", round(quantile(pct_65p, 0.25, na.rm = T), digits = 1), ", ", round(quantile(pct_65p, 0.75, na.rm = T), digits = 1), ")")) %>% 
   ungroup()
 
+neighborhood_summary5 <- community_areas_sociodemo5 %>% 
+  mutate(Neighborhood = factor(Neighborhood, levels = c("Far North Side", "Northwest Side", "North Side", "West Side", "Central", "South Side",
+                                          "Southwest Side", "Far Southwest Side", "Far Southeast Side"))) %>% 
+  group_by(Neighborhood) %>% 
+  summarise(ADMR = paste0(round(median(ADMR, na.rm = T),digits = 1), " (", round(quantile(ADMR, 0.25, na.rm = T), digits = 1), ", ", round(quantile(ADMR, 0.75, na.rm = T), digits = 1), ")")) %>% 
+  ungroup()
+
 neighborhood_summary %>% kbl(caption = "Table 1. Mean (SD) of Sociodemographic Characteristics in Neighborhood Areas") %>%
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
 
@@ -336,6 +349,9 @@ neighborhood_summary3 %>% kbl(caption = "Table 1 Continued") %>%
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
 
 neighborhood_summary4 %>% kbl(caption = "Table 1 Continued") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
+
+neighborhood_summary5 %>% kbl(caption = "Table 1 Continued") %>%
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center", fixed_thead  = T) 
 
 ```
